@@ -1,7 +1,7 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { CommandRunInput, ModelForkResult, On, PromptSubmitInput, SessionStartInput, TurnCompleteInput, TurnUsage } from 'claude-code'
 
-import { fmtDuration, freshState, parseDuration, resetForClear, seedFromResume } from '../hooks/register'
+import { fmtDuration, freshState, parseDuration, pingOverdue, resetForClear, seedFromResume } from '../hooks/register'
 
 tier('user')
 
@@ -28,7 +28,7 @@ const run = (command: 'keepwarm' | 'cache-tax', args: string): CommandRunInput =
 
 const prompt = (text: string): PromptSubmitInput => ({ text, wait: false, origin: { kind: 'composer' } })
 
-type ForkAnswer = null | { read: number; write: number; out?: number; input?: number }
+type ForkAnswer = null | 'hang' | { read: number; write: number; out?: number; input?: number }
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
@@ -60,6 +60,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
     forks.push(forks.length)
     const a = forkAnswers.shift()
     if (a === null || a === undefined) return { value: null }
+    if (a === 'hang') return new Promise<never>(() => {})
     const value: ModelForkResult = { text: 'warm', usage: { input_tokens: a.input ?? 2, output_tokens: a.out ?? 1, cache_read_input_tokens: a.read, cache_creation_input_tokens: a.write } }
     return { value }
   })
@@ -196,6 +197,24 @@ describe('guard', () => {
     expect(card.text).toMatch(/reset by compaction/)
   })
 
+  test('an armed window keeps pinging after compaction; the first ping primes the new prefix instead of stopping', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [{ read: 0, write: 15000 }, { read: 15000, write: 0 }])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', ''))
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'old', toolUses: [] }] })
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.logs.at(-1)).toMatch(/primed the compacted context, 15k tokens/)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    const card = await $.command.run(run('cache-tax', ''))
+    expect(card.text).toMatch(/context     15,000 tokens/)
+    expect(card.text).not.toMatch(/stopped/)
+  })
+
   test('a cold resume seeds the guard before any turn and returns the estimate line', async () => {
     const s = freshState()
     const now = START
@@ -230,6 +249,60 @@ describe('keepwarm', () => {
     expect(w.status.at(-1)).toMatch(/keepwarm 5h10m left · ping in 50m · last ping read 200k \$0\.05/)
     await clock.advance(50 * MIN)
     expect(w.forks.length).toBe(2)
+  })
+
+  test('a hung fork is given up after 2m and pinged again', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, ['hang', warm, warm])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '6h'))
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    await clock.advance(2 * MIN + 5000)
+    expect(w.logs.some(l => /no answer/.test(l))).toBe(true)
+    expect(w.forks.length).toBe(2)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(3)
+  })
+
+  test('pingOverdue is true only for an armed, warm, idle session past its period', () => {
+    const s = freshState()
+    s.deadline = START + 6 * HOUR
+    s.lastRequestAt = START
+    const at = (ms: number) => START + ms
+    expect(pingOverdue(s, at(50 * MIN + MIN + 1))).toBe(true)
+    expect(pingOverdue(s, at(50 * MIN + 30_000))).toBe(false)
+    s.pinging = at(51 * MIN)
+    expect(pingOverdue(s, at(52 * MIN))).toBe(false)
+    s.pinging = at(MIN)
+    expect(pingOverdue(s, at(52 * MIN))).toBe(true)
+    s.pinging = 0
+    expect(pingOverdue(s, at(HOUR))).toBe(false)
+    s.compacted = true
+    expect(pingOverdue(s, at(HOUR))).toBe(true)
+    s.compacted = false
+    s.deadline = 0
+    expect(pingOverdue(s, at(52 * MIN))).toBe(false)
+  })
+
+  test('the watchdog pings when the regular timer is lost', async ($, on) => {
+    // The kit's clock cannot drop one timer, and on() refuses a second clock.after handler, so wrap the mock's own.
+    let hold: (...a: any[]) => unknown = () => undefined
+    const clock = mock.clock(((name: string, h: any) => { if (name === 'clock.after') hold = h; else (on as any)(name, h) }) as On, { now: START })
+    let lost = false
+    on('clock.after', (($: unknown, e: { ms: number }, next: unknown) => {
+      if (!lost && e.ms > 40 * MIN && e.ms < 2 * HOUR) { lost = true; return new Promise<never>(() => {}) }
+      return hold($, e, next)
+    }) as any)
+    const w = world(on, [warm, warm])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '6h'))
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN + MIN + 5 * MIN)
+    expect(lost).toBe(true)
+    expect(w.forks.length).toBe(1)
+    expect(w.logs.some(l => /overdue/.test(l))).toBe(true)
   })
 
   test('a new turn resets the countdown', async ($, on) => {
@@ -324,9 +397,9 @@ describe('keepwarm', () => {
     const w = world(on, [warm])
     await $.session.start(session)
     const r = await $.command.run(run('keepwarm', ''))
-    expect(r.text).toMatch(/^keepwarm on for 6h00m, a ping 50m after each idle stretch/)
+    expect(r.text).toMatch(/^keepwarm on for 24h00m, a ping 50m after each idle stretch/)
     await $.turn.complete(turn())
-    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · ping in 50m')
+    expect(w.status.at(-1)).toBe('keepwarm 24h00m left · ping in 50m')
     await clock.advance(50 * MIN)
     expect(w.forks.length).toBe(1)
   })
@@ -336,8 +409,8 @@ describe('keepwarm', () => {
     const store = new Map<string, unknown>([['always', true], ['deadline:S1', START - MIN], ['every:S1', MIN]])
     const w = world(on, [warm], { store })
     await $.session.start(session)
-    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
-    expect(store.get('deadline:S1')).toBe(START + 6 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 24h00m left · waiting for the first turn')
+    expect(store.get('deadline:S1')).toBe(START + 24 * HOUR)
     expect(store.has('every:S1')).toBe(false)
     await $.turn.complete(turn())
     await clock.advance(1 * MIN)
@@ -345,7 +418,7 @@ describe('keepwarm', () => {
     await clock.advance(49 * MIN)
     expect(w.forks.length).toBe(1)
     const card = await $.command.run(run('cache-tax', ''))
-    expect(card.text).toMatch(/keepwarm    on, 5h10m left · ping in 50m · last ping read 200k \$0\.05 \(always\)/)
+    expect(card.text).toMatch(/keepwarm    on, 23h10m left · ping in 50m · last ping read 200k \$0\.05 \(always\)/)
     const off = await $.command.run(run('keepwarm', 'off'))
     expect(off.text).toBe('keepwarm is off, and no longer arms itself at session start')
     expect(store.has('always')).toBe(false)
@@ -358,10 +431,10 @@ describe('keepwarm', () => {
     const w = world(on, [], { store })
     await $.session.start(session)
     const r = await $.command.run(run('keepwarm', 'always'))
-    expect(r.text).toMatch(/^keepwarm always on: every session starts with a 6h00m window/)
+    expect(r.text).toMatch(/^keepwarm always on: every session starts with a 24h00m window/)
     expect(store.get('always')).toBe(true)
-    expect(store.get('deadline:S1')).toBe(START + 6 * HOUR)
-    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
+    expect(store.get('deadline:S1')).toBe(START + 24 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 24h00m left · waiting for the first turn')
   })
 
   test('the ping figure counts output tokens at the model\'s rate, Sonnet 5 priced as itself', async ($, on) => {
@@ -431,16 +504,16 @@ describe('keepwarm', () => {
     await $.turn.complete(turn())
     await clock.advance(15 * 24 * HOUR)
     const r = await $.command.run(run('keepwarm', ''))
-    expect(r.text).toBe('keepwarm on for 6h00m. The cache is cold now, so the first ping comes 50m after the next turn')
-    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · cold now, first ping 50m after the next turn')
+    expect(r.text).toBe('keepwarm on for 24h00m. The cache is cold now, so the first ping comes 50m after the next turn')
+    expect(w.status.at(-1)).toBe('keepwarm 24h00m left · cold now, first ping 50m after the next turn')
     await clock.advance(1 * MIN)
     expect(w.forks.length).toBe(0)
     await clock.advance(60 * MIN)
     expect(w.forks.length).toBe(0)
     const card = await $.command.run(run('cache-tax', ''))
-    expect(card.text).toMatch(/keepwarm    on, 4h59m left · cold now, first ping 50m after the next turn/)
+    expect(card.text).toMatch(/keepwarm    on, 22h59m left · cold now, first ping 50m after the next turn/)
     await $.turn.complete(turn())
-    expect(w.status.at(-1)).toBe('keepwarm 4h59m left · ping in 50m')
+    expect(w.status.at(-1)).toBe('keepwarm 22h59m left · ping in 50m')
     await clock.advance(49 * MIN)
     expect(w.forks.length).toBe(0)
     await clock.advance(1 * MIN)
@@ -458,11 +531,11 @@ describe('keepwarm', () => {
     // The test kit cannot raise classic.SessionStart, so the cold state comes from the turn above and a second start arms the switch over it.
     store.set('always', true)
     await $.session.start(session)
-    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · cold now, first ping 50m after the next turn')
+    expect(w.status.at(-1)).toBe('keepwarm 24h00m left · cold now, first ping 50m after the next turn')
     await clock.advance(1 * MIN)
     expect(w.forks.length).toBe(0)
     const r = await $.command.run(run('keepwarm', 'always'))
-    expect(r.text).toBe('keepwarm always on: every session starts with a 6h00m window; /keepwarm off turns it off for good. The cache is cold now, so the first ping comes 50m after the next turn')
+    expect(r.text).toBe('keepwarm always on: every session starts with a 24h00m window; /keepwarm off turns it off for good. The cache is cold now, so the first ping comes 50m after the next turn')
     await clock.advance(60 * MIN)
     expect(w.forks.length).toBe(0)
     await $.turn.complete(turn())

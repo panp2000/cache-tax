@@ -1,5 +1,16 @@
 # cache-tax
 
+> **Fork notes.** Forked from [karanb192/cache-tax](https://github.com/karanb192/cache-tax) (plugin 2.1.3). Changes in 2.1.4, only in `hooks/register.ts` and `tests/register.test.ts`:
+> 1. Default `/keepwarm` window 6h -> 24h (text and tests updated).
+> 2. Added the `opus-5-5` price row.
+> 3. Hung-fork timeout (`FORK_TIMEOUT_MS`) plus watchdog, with 3 new tests.
+>
+> Install this fork:
+> ```
+> claude plugin marketplace add panp2000/cache-tax
+> claude plugin install cache-tax@panp-cache-tax
+> ```
+
 **Keep Claude Code's prompt cache warm during breaks.**
 
 On Fable 5.1, a one-hour cache write costs **80x a cache read per token**: [$20 versus $0.25 per million tokens](https://platform.claude.com/docs/en/about-claude/pricing). Run `/keepwarm` before stepping away. If you return cold, the guard stops your send once with the estimated rewrite price.

@@ -1,11 +1,15 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code';
 
 const TTL_MS = 60 * 60 * 1000
 const PING_AFTER_MS = 50 * 60 * 1000
 const MIN_PING_MS = 60 * 1000
 const AUTO_WARM_MS = 3 * 60 * 60 * 1000
-const DEFAULT_WINDOW_MS = 6 * 60 * 60 * 1000
+const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000
 const BIG_TOKENS = 50000
+// 2026-10-01: three pings worked, the fourth never came, nothing stopped. Either the fork never resolved or the timer was lost; guard both.
+const FORK_TIMEOUT_MS = 2 * 60 * 1000
+const WATCH_MS = 5 * 60 * 1000
+const OVERDUE_MS = 60 * 1000
 const PING_PROMPT = 'Reply with the single word: warm'
 const KEY_DEADLINE = 'deadline'
 const KEY_EVERY = 'every'
@@ -17,6 +21,7 @@ const KEY_ALWAYS = 'always'
 const PRICES: Array<[string, number, number, number]> = [
   ['fable-5-1', 0.25, 20, 50],
   ['fable-5', 1, 20, 50],
+  ['opus-5-5', 0.2, 8, 20],
   ['opus-5', 0.5, 10, 25],
   ['opus-4', 0.5, 10, 25],
   ['sonnet-5', 0.2, 4, 10],
@@ -44,6 +49,8 @@ export type State = {
   pending: { cancel: () => void } | null
   last: PingRecord | null
   stopped: string | null
+  pinging: number
+  watching: boolean
 }
 
 function priceOf(model: string | null): [number, number, number] | null {
@@ -198,7 +205,7 @@ async function arm($: EngineInterface, s: State) {
   const now = await $.clock.now()
   if (now >= s.deadline) return stop($, s, null)
   // A cold window still needs expiry cleanup, but must not send a model request.
-  if (s.lastRequestAt && !s.compacted && !isCold(s, now)) {
+  if (s.lastRequestAt && (s.compacted || !isCold(s, now))) {
     const delay = Math.min(s.deadline - now, Math.max(1000, s.lastRequestAt + s.every - now))
     s.pending = $.clock.after(delay, () => { void ping($, s) })
   } else {
@@ -216,10 +223,22 @@ async function ping($: EngineInterface, s: State) {
   if (now - s.lastRequestAt < s.every - 1000) return
   if (isCold(s, now)) return arm($, s)
   let reply
+  let timer: { cancel: () => void } | null = null
+  if (s.pinging && now - s.pinging <= FORK_TIMEOUT_MS + WATCH_MS) return
+  s.pinging = now
   try {
-    reply = await $.model.fork({ prompt: PING_PROMPT })
+    const timeout = new Promise<'timeout'>(resolve => { timer = $.clock.after(FORK_TIMEOUT_MS, () => resolve('timeout')) })
+    const got = await Promise.race([$.model.fork({ prompt: PING_PROMPT }), timeout])
+    if (got === 'timeout') {
+      $.ui.log(`keepwarm: the ping got no answer in ${fmtDuration(FORK_TIMEOUT_MS)}, trying again`)
+      return arm($, s)
+    }
+    reply = got
   } catch (err) {
     return stop($, s, `the ping failed, ${err instanceof Error ? err.message : String(err)}`)
+  } finally {
+    timer?.cancel()
+    s.pinging = 0
   }
   if (reply === null) return stop($, s, 'the engine did not send the ping, either the snapshot was cold or the API call failed')
   const u = reply.usage
@@ -228,9 +247,30 @@ async function ping($: EngineInterface, s: State) {
   const warm = u.cache_read_input_tokens > 0 && u.cache_creation_input_tokens < 0.1 * u.cache_read_input_tokens
   const usd = price ? pingUsd(u, price) : null
   s.last = { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, usd, warm }
-  if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
+  if (s.compacted) {
+    s.compacted = false
+    s.ctx = u.cache_read_input_tokens + u.cache_creation_input_tokens
+    $.ui.log(`keepwarm primed the compacted context, ${fmtTok(s.ctx)} tokens (${fmtUsd(usd)})`)
+  } else if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
   s.lastRequestAt = now
   await arm($, s)
+}
+
+/** A ping that should have fired by now: armed, warm, idle, and past its period by more than OVERDUE_MS. */
+export function pingOverdue(s: State, now: number): boolean {
+  return s.deadline > 0 && now < s.deadline && (!s.pinging || now - s.pinging > FORK_TIMEOUT_MS + WATCH_MS) && s.lastRequestAt > 0 && (s.compacted || !isCold(s, now)) &&
+    now - s.lastRequestAt > s.every + OVERDUE_MS
+}
+
+// Backstop for a lost timer: every WATCH_MS, send the ping if it is overdue.
+function watch($: EngineInterface, s: State) {
+  $.clock.after(WATCH_MS, async () => {
+    watch($, s)
+    if (!pingOverdue(s, await $.clock.now())) return
+    $.ui.log('keepwarm: a ping was overdue, sending it now')
+    disarm(s)
+    await ping($, s)
+  })
 }
 
 /** The reply to an arming command; on a cold cache it says when the first ping can come. */
@@ -253,14 +293,14 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, every
 function card(s: State, now: number): string {
   const lines: string[] = []
   lines.push(`${s.lastModel ?? 'model not seen yet'}`)
-  if (s.compacted) lines.push('state       reset by compaction, waiting for the first turn')
+  if (s.compacted) lines.push(s.deadline ? 'state       reset by compaction, the next ping primes the new context' : 'state       reset by compaction, waiting for the first turn')
   else if (!s.lastRequestAt) lines.push('state       no request yet this session')
   else if (isCold(s, now)) lines.push(`state       COLD, last request ${fmtDuration(now - s.lastRequestAt)} ago`)
   else lines.push(`state       warm, ${fmtDuration(s.lastRequestAt + TTL_MS - now)} left`)
   lines.push(`context     ${s.ctx.toLocaleString('en-US')} tokens`)
   lines.push(`cold cost   ${fmtUsd(coldUsd(s))} to re-write it (warm turn ${fmtUsd(warmUsd(s))})`)
   const always = s.always ? ' (always)' : ''
-  const idle = s.always ? 'off until the next session start, which arms 6h00m (always)' : 'off (/keepwarm to arm it for 6h00m)'
+  const idle = s.always ? 'off until the next session start, which arms 24h00m (always)' : 'off (/keepwarm to arm it for 24h00m)'
   lines.push(`keepwarm    ${s.deadline ? (statusText(s, now) ?? '').replace(/^keepwarm /, 'on, ') + always : s.stopped ? `stopped, ${s.stopped}${always}` : idle}`)
   const pings = breakEvenPings(s)
   if (pings != null) lines.push(`break-even  up to ${pings} pings at the read rate cost one cold write, about ${fmtDuration(pings * s.every)} of idle at one ping per ${fmtDuration(s.every)}`)
@@ -273,7 +313,7 @@ function card(s: State, now: number): string {
 export function freshState(): State {
   return {
     sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
-    guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
+    guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null, pinging: 0, watching: false,
   }
 }
 
@@ -298,8 +338,8 @@ export const register: Register = on => {
     if (usage.context.tokens) s.ctx = usage.context.tokens
     await $.command.register({
       name: 'keepwarm',
-      description: 'Keep the prompt cache warm: bare for 6h, a window such as 90m, always, off, or status (cache-tax)',
-      argumentHint: '[6h | always | off | status]',
+      description: 'Keep the prompt cache warm: bare for 24h, a window such as 90m, always, off, or status (cache-tax)',
+      argumentHint: '[24h | always | off | status]',
       immediate: true,
     })
     await $.command.register({
@@ -314,6 +354,7 @@ export const register: Register = on => {
       $.ui.log('the hook form (cache-tax@claude-code-hooks) is also installed, so a cold send is warned about or refused twice. Uninstall it, or /cache-tax guard warn here.')
     }
     $.ui.status(statusText(s, now))
+    if (!s.watching) { s.watching = true; watch($, s) }
     return r
   })
 
@@ -327,6 +368,8 @@ export const register: Register = on => {
       s.stopped = null
       resetForClear(s)
       s.sid = await $.session.id()
+      // always survives /clear: the new conversation gets its own window, pinging from its first turn.
+      if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
       $.ui.status(statusText(s, await $.clock.now()))
       return r
     }
@@ -360,7 +403,7 @@ export const register: Register = on => {
     }
     if (words[0] !== 'status') {
       const window = parseDuration(words[0])
-      if (window == null) return { text: 'keepwarm takes a window such as 6h or 90m, or always, off, or status' }
+      if (window == null) return { text: 'keepwarm takes a window such as 24h or 90m, or always, off, or status' }
       // "every 2m" is a testing knob and lasts only for the window it was given with.
       let every = PING_AFTER_MS
       if (words[1] === 'every') {
@@ -453,7 +496,9 @@ export const register: Register = on => {
       s.compacted = true
       s.ctx = 0
       s.ackedAt = 0
-      disarm(s)
+      // An armed window keeps pinging; the first ping after compaction primes the new prefix.
+      s.lastRequestAt = await $.clock.now()
+      await arm($, s)
     }
     return r
   })

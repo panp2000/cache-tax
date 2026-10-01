@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "panp-cache-tax",
+  "description": "panp2000's fork of karanb192/cache-tax (24h default window, opus-5-5 price row, hung-fork watchdog).",
+  "owner": {
+    "name": "panp2000",
+    "url": "https://github.com/panp2000"
+  },
+  "plugins": [
+    {
+      "name": "cache-tax",
+      "source": "./",
+      "description": "Fork of cache-tax: keeps the 1-hour prompt cache warm (/keepwarm), stops cold sends once with their price. 24h default window, opus-5-5 price row, hung-fork timeout and watchdog."
+    }
+  ]
+}
